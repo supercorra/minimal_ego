@@ -1,1 +1,0 @@
-ALTER TABLE "movie_library" ADD COLUMN "dismissed" boolean DEFAULT false NOT NULL;

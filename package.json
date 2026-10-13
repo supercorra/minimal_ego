@@ -5,20 +5,18 @@
   "type": "module",
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "db:generate": "drizzle-kit generate",
     "dev": "node scripts/prepare-site.mjs && npx netlify dev"
   },
   "dependencies": {
-    "@netlify/database": "^2.0.1",
+    "@neondatabase/serverless": "^1.2.0",
     "@netlify/functions": "^6.0.2",
     "@netlify/identity": "^2.0.0",
-    "drizzle-orm": "^1.0.0-beta.22"
+    "drizzle-orm": "^1.0.0-beta.22",
+    "esbuild": "^0.25.12",
+    "tailwindcss": "3.4.17"
   },
   "devDependencies": {
     "@types/node": "^26.6.4",
-    "drizzle-kit": "^1.0.0-beta.22",
-    "esbuild": "^0.25.12",
-    "typescript": "^7.0.2",
-    "tailwindcss": "3.4.17"
+    "typescript": "^7.0.2"
   }
 }
