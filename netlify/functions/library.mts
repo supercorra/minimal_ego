@@ -1,0 +1,282 @@
+import { and, eq, isNull, sql } from "drizzle-orm";
+import { getUser } from "@netlify/identity";
+import type { Config } from "@netlify/functions";
+import { createDatabase } from "../../db/index.js";
+import { legacyLibraryImport, movieLibrary } from "../../db/schema.js";
+
+type Database = ReturnType<typeof createDatabase>;
+type MovieInput = { id: number; title: string; poster_path?: string | null; release_date?: string | null; overview?: string | null };
+
+const IMPORT_BATCH_LIMIT = 100;
+const noStore = { "Cache-Control": "no-store" };
+
+function respond(body: unknown, status = 200) {
+  return Response.json(body, { status, headers: noStore });
+}
+
+async function readLibrary(database: Database, ownerId: string) {
+  const records = await database.select().from(movieLibrary).where(eq(movieLibrary.ownerHash, ownerId));
+  const watchlist: number[] = [];
+  const ratings: Record<string, { score: number; notes: string; watched_at: string | null; preference: string | null; pinned_position: number | null; magic_factor: number }> = {};
+  const movies = records.filter((record) => record.watchlisted || record.score !== null).map((record) => {
+    if (record.watchlisted) watchlist.push(record.movieId);
+    if (record.score !== null) {
+      ratings[record.movieId] = { score: record.score, notes: record.notes, watched_at: record.watchedAt, preference: record.preference, pinned_position: record.pinnedPosition, magic_factor: record.magicFactor };
+    }
+    return {
+      id: record.movieId,
+      title: record.title,
+      poster_path: record.posterPath,
+      release_date: record.releaseDate,
+      overview: record.overview,
+      year: record.year,
+      original_title: record.originalTitle,
+      director: record.director,
+      genres: record.genres,
+      runtime_minutes: record.runtimeMinutes,
+      external_rating: record.externalRating,
+      added_at: record.addedAt,
+    };
+  });
+  const dismissed = records.filter((record) => record.dismissed).map((record) => ({
+    id: record.movieId,
+    title: record.title,
+    poster_path: record.posterPath,
+    release_date: record.releaseDate,
+    overview: record.overview,
+    year: record.year,
+    director: record.director,
+    genres: record.genres,
+    country: record.country,
+  }));
+  return { watchlist, ratings, movies, dismissed };
+}
+
+// Sposta nella libreria dell'account i film del vecchio archivio associati alla sua email (Identity rilascia la sessione solo a email confermate).
+// Un voto già dato nella nuova app prevale su quello importato.
+async function claimLegacyLibrary(database: Database, ownerId: string, email: string) {
+  const pending = await database.select({ movieId: legacyLibraryImport.movieId }).from(legacyLibraryImport)
+    .where(eq(legacyLibraryImport.email, email)).limit(1);
+  if (!pending.length) return;
+  await database.execute(sql`
+    INSERT INTO movie_library AS existing (owner_hash, movie_id, title, poster_path, overview, watchlisted, score, notes,
+      original_title, year, director, genres, runtime_minutes, country, backdrop_path, trailer_url, external_rating,
+      external_votes, watched_at, preference, magic_factor, pinned_position, added_at)
+    SELECT ${ownerId}, movie_id, title, poster_path, overview, watchlisted, score, notes,
+      original_title, year, director, genres, runtime_minutes, country, backdrop_path, trailer_url, external_rating,
+      external_votes, watched_at, preference, magic_factor, pinned_position, added_at
+    FROM legacy_library_import WHERE email = ${email}
+    ON CONFLICT (owner_hash, movie_id) DO UPDATE SET
+      score = COALESCE(existing.score, excluded.score),
+      notes = CASE WHEN existing.score IS NULL THEN excluded.notes ELSE existing.notes END,
+      watchlisted = COALESCE(existing.score, excluded.score) IS NULL,
+      original_title = excluded.original_title, year = excluded.year, director = excluded.director,
+      genres = excluded.genres, runtime_minutes = excluded.runtime_minutes, country = excluded.country,
+      backdrop_path = excluded.backdrop_path, trailer_url = excluded.trailer_url,
+      external_rating = excluded.external_rating, external_votes = excluded.external_votes,
+      watched_at = excluded.watched_at, preference = excluded.preference, magic_factor = excluded.magic_factor,
+      pinned_position = excluded.pinned_position, added_at = LEAST(existing.added_at, excluded.added_at)`);
+  await database.delete(legacyLibraryImport).where(eq(legacyLibraryImport.email, email));
+}
+
+function isValidMovie(movie: any): movie is MovieInput {
+  return Boolean(movie) && Number.isSafeInteger(movie.id) && movie.id >= 1 && movie.id <= 2147483647
+    && typeof movie.title === "string" && Boolean(movie.title.trim()) && movie.title.length <= 500
+    && (movie.poster_path == null || (typeof movie.poster_path === "string" && /^\/[a-zA-Z0-9_.-]+$/.test(movie.poster_path)))
+    && (movie.release_date == null || (typeof movie.release_date === "string" && /^(\d{4}-\d{2}-\d{2})?$/.test(movie.release_date)))
+    && (movie.overview == null || (typeof movie.overview === "string" && movie.overview.length <= 10000));
+}
+
+function isValidScore(score: unknown): score is number {
+  return typeof score === "number" && Number.isFinite(score) && score >= 1 && score <= 10;
+}
+
+function movieMetadata(movie: MovieInput) {
+  return {
+    title: movie.title.trim(),
+    posterPath: movie.poster_path || null,
+    releaseDate: movie.release_date || "",
+    overview: movie.overview || "",
+  };
+}
+
+async function readJSONBody(request: Request, maxLength: number) {
+  if (!request.headers.get("content-type")?.startsWith("application/json")) {
+    return { error: respond({ error: "Formato richiesta non valido." }, 415) };
+  }
+  const raw = await request.text();
+  if (raw.length > maxLength) return { error: respond({ error: "Richiesta troppo grande." }, 413) };
+  try {
+    return { body: JSON.parse(raw) };
+  } catch {
+    return { error: respond({ error: "Richiesta non valida." }, 400) };
+  }
+}
+
+async function saveSingle(database: Database, ownerId: string, body: any) {
+  const movie = body?.movie;
+  if (!isValidMovie(movie) || !["watchlist", "rate", "pin", "dismiss", "unrate"].includes(body.action)) {
+    return respond({ error: "Dati del film non validi." }, 400);
+  }
+  if (body.action === "watchlist" && typeof body.watchlisted !== "boolean") {
+    return respond({ error: "Stato watchlist non valido." }, 400);
+  }
+  if (body.action === "rate" && (!isValidScore(body.score) || typeof body.notes !== "string" || body.notes.length > 5000)) {
+    return respond({ error: "Il voto deve essere tra 1 e 10; le note possono contenere massimo 5000 caratteri." }, 400);
+  }
+  if (body.action === "unrate") {
+    await database.update(movieLibrary).set({ score: null, pinnedPosition: null }).where(and(
+      eq(movieLibrary.ownerHash, ownerId), eq(movieLibrary.movieId, movie.id)
+    ));
+    return respond(await readLibrary(database, ownerId));
+  }
+  if (body.action === "dismiss") {
+    if (typeof body.dismissed !== "boolean") return respond({ error: "Stato non valido." }, 400);
+    const details = body.details && typeof body.details === "object" ? body.details : {};
+    const text = (value: unknown) => (typeof value === "string" && value.trim() ? value.trim().slice(0, 300) : null);
+    if (body.dismissed) {
+      await database.insert(movieLibrary).values({
+        ownerHash: ownerId,
+        movieId: movie.id,
+        ...movieMetadata(movie),
+        dismissed: true,
+        director: text(details.director),
+        genres: text(details.genres),
+        country: text(details.country),
+      }).onConflictDoUpdate({
+        target: [movieLibrary.ownerHash, movieLibrary.movieId],
+        set: { dismissed: true },
+      });
+    } else {
+      await database.update(movieLibrary).set({ dismissed: false }).where(and(
+        eq(movieLibrary.ownerHash, ownerId),
+        eq(movieLibrary.movieId, movie.id),
+      ));
+      await database.delete(movieLibrary).where(and(
+        eq(movieLibrary.ownerHash, ownerId),
+        eq(movieLibrary.movieId, movie.id),
+        eq(movieLibrary.watchlisted, false),
+        isNull(movieLibrary.score),
+        eq(movieLibrary.dismissed, false),
+      ));
+    }
+    return respond(await readLibrary(database, ownerId));
+  }
+  if (body.action === "pin") {
+    const position = body.position;
+    if (position !== null && !(Number.isSafeInteger(position) && position >= 1 && position <= 1000)) {
+      return respond({ error: "La posizione deve essere un numero da 1 a 1000." }, 400);
+    }
+    await database.update(movieLibrary).set({ pinnedPosition: position }).where(and(
+      eq(movieLibrary.ownerHash, ownerId),
+      eq(movieLibrary.movieId, movie.id),
+    ));
+    return respond(await readLibrary(database, ownerId));
+  }
+  const metadata = movieMetadata(movie);
+  const changes = body.action === "rate"
+    ? { ...metadata, score: Math.round(body.score * 10) / 10, notes: body.notes.trim(), watchlisted: false, dismissed: false }
+    : { ...metadata, watchlisted: body.watchlisted, ...(body.watchlisted ? { dismissed: false, score: null, pinnedPosition: null } : {}) };
+  await database.insert(movieLibrary).values({
+    ownerHash: ownerId,
+    movieId: movie.id,
+    ...changes,
+  }).onConflictDoUpdate({
+    target: [movieLibrary.ownerHash, movieLibrary.movieId],
+    set: changes,
+  });
+  await database.delete(movieLibrary).where(and(
+    eq(movieLibrary.ownerHash, ownerId),
+    eq(movieLibrary.movieId, movie.id),
+    eq(movieLibrary.watchlisted, false),
+    isNull(movieLibrary.score),
+    eq(movieLibrary.dismissed, false),
+  ));
+  return respond(await readLibrary(database, ownerId));
+}
+
+async function saveImport(database: Database, ownerId: string, body: any) {
+  const items = body?.items;
+  if (!Array.isArray(items) || !items.length || items.length > IMPORT_BATCH_LIMIT) {
+    return respond({ error: `Invia da 1 a ${IMPORT_BATCH_LIMIT} film per blocco.` }, 400);
+  }
+  // Un film ripetuto nello stesso blocco viene unito: il voto prevale sulla watchlist.
+  const byMovie = new Map<number, { movie: MovieInput; score: number | null; notes: string }>();
+  for (const item of items) {
+    const score = item?.score ?? null;
+    const notes = item?.notes ?? "";
+    if (!isValidMovie(item?.movie) || (score !== null && !isValidScore(score))
+      || typeof notes !== "string" || notes.length > 5000 || (score === null && item.watchlisted !== true)) {
+      return respond({ error: "Uno dei film da importare contiene dati non validi." }, 400);
+    }
+    const previous = byMovie.get(item.movie.id);
+    if (previous && previous.score !== null && score === null) continue;
+    byMovie.set(item.movie.id, { movie: item.movie, score: score === null ? null : Math.round(score * 10) / 10, notes: notes.trim() });
+  }
+
+  const rated = [];
+  const watchlisted = [];
+  for (const { movie, score, notes } of byMovie.values()) {
+    const base = { ownerHash: ownerId, movieId: movie.id, ...movieMetadata(movie) };
+    if (score !== null) rated.push({ ...base, score, notes, watchlisted: false });
+    else watchlisted.push({ ...base, watchlisted: true });
+  }
+
+  const target = [movieLibrary.ownerHash, movieLibrary.movieId];
+  const metadataFromImport = {
+    title: sql`excluded.title`,
+    posterPath: sql`excluded.poster_path`,
+    releaseDate: sql`excluded.release_date`,
+    overview: sql`excluded.overview`,
+  };
+  if (rated.length) {
+    await database.insert(movieLibrary).values(rated).onConflictDoUpdate({
+      target,
+      set: {
+        ...metadataFromImport,
+        score: sql`excluded.score`,
+        // Le note esistenti restano se il file non ne contiene di nuove.
+        notes: sql`CASE WHEN excluded.notes = '' THEN ${sql.raw('"movie_library"."notes"')} ELSE excluded.notes END`,
+        watchlisted: false,
+      },
+    });
+  }
+  if (watchlisted.length) {
+    await database.insert(movieLibrary).values(watchlisted).onConflictDoUpdate({
+      target,
+      set: { ...metadataFromImport, watchlisted: true },
+    });
+  }
+  return respond({ imported: byMovie.size, rated: rated.length, watchlisted: watchlisted.length });
+}
+
+export default async function handler(request: Request) {
+  const isImport = new URL(request.url).pathname === "/api/library/import";
+  const allowed = isImport ? ["POST"] : ["GET", "POST"];
+  if (!allowed.includes(request.method)) {
+    return Response.json({ error: "Metodo non consentito." }, { status: 405, headers: { ...noStore, Allow: allowed.join(", ") } });
+  }
+
+  const user = await getUser();
+  if (!user?.id) {
+    return respond({ error: "Non autorizzato. Accedi per vedere e salvare i tuoi film." }, 401);
+  }
+
+  try {
+    const database = createDatabase();
+    if (request.method === "GET") {
+      if (user.email) await claimLegacyLibrary(database, user.id, user.email.trim().toLowerCase());
+      return respond(await readLibrary(database, user.id));
+    }
+    if (request.headers.get("origin") !== new URL(request.url).origin) {
+      return respond({ error: "Richiesta non consentita. Ricarica la pagina." }, 403);
+    }
+    const { body, error } = await readJSONBody(request, isImport ? 1_500_000 : 20000);
+    if (error) return error;
+    return await (isImport ? saveImport(database, user.id, body) : saveSingle(database, user.id, body));
+  } catch {
+    return respond({ error: "Salvataggio Netlify non disponibile. Riprova più tardi." }, 503);
+  }
+}
+
+export const config: Config = { path: ["/api/library", "/api/library/import"] };
