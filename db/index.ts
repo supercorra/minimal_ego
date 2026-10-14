@@ -1,10 +1,6 @@
-import { neon } from "@neondatabase/serverless";
-import { drizzle } from "drizzle-orm/neon-http";
+import { drizzle } from "drizzle-orm/netlify-db";
 import * as schema from "./schema.js";
 
 export function createDatabase() {
-  const url = process.env.DATABASE_URL;
-  if (!url) throw new Error("DATABASE_URL non configurata.");
-  const sql = neon(url);
-  return drizzle({ client: sql, schema });
+  return drizzle({ schema });
 }

@@ -5,3 +5,6 @@ public/
 .netlify
 
 .env
+
+.DS_Store
+.backup/
